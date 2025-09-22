@@ -21,46 +21,46 @@ function todayKey() {
   const tzNow = new Date(now.toLocaleString('en-US', { timeZone: TZ }));
   return `${tzNow.getFullYear()}${String(tzNow.getMonth()+1).padStart(2,'0')}${String(tzNow.getDate()).padStart(2,'0')}`;
 }
-function hashMod(str, mod) { let h=0; for(let i=0;i<str.length;i++) h=((h<<5)-h+str.charCodeAt(i))|0; return Math.abs(h)%mod; }
+function hashMod(str, mod){ let h=0; for(let i=0;i<str.length;i++) h=((h<<5)-h+str.charCodeAt(i))|0; return Math.abs(h)%mod; }
 function pickToday(){ return VERSE_POOL[ hashMod(todayKey(), VERSE_POOL.length) ]; }
 
 async function fetchFHLVerse(book, chap, verse) {
   const url = 'https://bible.fhl.net/json/qb.php?q=' + encodeURIComponent(`${book}${chap}:${verse}`);
   try {
-    const res = await fetch(url);
-    const txt = await res.text();
-    console.log('[FHL] status', res.status, 'len', txt.length);
-    const data = JSON.parse(txt);
-    const rec = data?.record?.[0];
+    const r = await fetch(url);
+    const t = await r.text();
+    console.log('[FHL] status', r.status, 'len', t.length);
+    const d = JSON.parse(t); const rec = d?.record?.[0];
     return `（${book}${chap}:${verse}）${(rec?.bible_text ?? '').toString().trim()}`;
-  } catch (e) {
-    console.error('[FHL] error', e);
-    return '（暫時無法取得 FHL 經文）';
-  }
+  } catch(e){ console.error('[FHL] error', e); return '（暫時無法取得 FHL 經文）'; }
 }
 
-async function replyMessage(replyToken, text) {
+async function lineReply(replyToken, text) {
   const payload = { replyToken, messages: [{ type: 'text', text }] };
-  const res = await fetch('https://api.line.me/v2/bot/message/reply', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + LINE_TOKEN },
-    body: JSON.stringify(payload),
-  });
-  const respText = await res.text();
-  console.log('[LINE reply] status', res.status, respText);
-  return res.ok;
+  try{
+    const r = await fetch('https://api.line.me/v2/bot/message/reply', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', Authorization:'Bearer '+LINE_TOKEN },
+      body: JSON.stringify(payload),
+    });
+    const body = await r.text();
+    console.log('[LINE reply]', r.status, body);
+    return r.ok;
+  }catch(e){ console.error('[LINE reply error]', e); return false; }
 }
 
-async function pushMessage(userId, text) {
-  const payload = { to: userId, messages: [{ type: 'text', text }] };
-  const res = await fetch('https://api.line.me/v2/bot/message/push', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + LINE_TOKEN },
-    body: JSON.stringify(payload),
-  });
-  const respText = await res.text();
-  console.log('[LINE push] status', res.status, respText);
-  return res.ok;
+async function linePush(userId, text) {
+  const payload = { to: userId, messages: [{ type:'text', text }] };
+  try{
+    const r = await fetch('https://api.line.me/v2/bot/message/push', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', Authorization:'Bearer '+LINE_TOKEN },
+      body: JSON.stringify(payload),
+    });
+    const body = await r.text();
+    console.log('[LINE push]', r.status, body);
+    return r.ok;
+  }catch(e){ console.error('[LINE push error]', e); return false; }
 }
 
 export default async function handler(req, event) {
@@ -71,41 +71,38 @@ export default async function handler(req, event) {
 
   const work = (async () => {
     try {
-      const bodyText = await req.text();
-      console.log('[req body]', bodyText.slice(0, 200));
-      const body = JSON.parse(bodyText || '{}');
+      const raw = await req.text();
+      console.log('[req body]', raw.slice(0,200));
+      const body = JSON.parse(raw || '{}');
       const events = body.events || [];
       console.log('[events length]', events.length);
 
       for (const ev of events) {
         if (ev.type !== 'message' || typeof ev.message?.text !== 'string') {
-          console.log('[skip] type=', ev.type);
+          console.log('[skip]', ev.type);
           continue;
         }
         const text = ev.message.text.trim();
         console.log('[incoming text]', text, 'userId=', ev.source?.userId);
 
-        if (!/^(每日經文|今日經文|經文)$/.test(text)) {
-          console.log('[skip] not match');
-          continue;
-        }
+        if (!/^(每日經文|今日經文|經文)$/.test(text)) { console.log('[skip] keyword'); continue; }
 
         const pick = pickToday();
         const verse = await fetchFHLVerse(pick.book, pick.chap, pick.verse);
         const msg = `📖 今日金句（${pick.book}${pick.chap}:${pick.verse}）\n${verse}\n來源：信望愛 FHL 查經平台`;
 
-        // 先嘗試 Reply
-        const ok = await replyMessage(ev.replyToken, msg);
+        // 1) 先 Reply
+        const replyOK = await lineReply(ev.replyToken, msg);
 
-        // 若 Reply 失敗（401/400/403），再「推播給同一位使用者」當備援
-        if (!ok && ev.source?.userId) {
-          console.log('[fallback] try push');
-          await pushMessage(ev.source.userId, msg + '\n(Reply失敗，改用Push)');
+        // 2) 無論成功與否，都再 Push 一次（確保你收到 & 取得狀態碼）
+        if (ev.source?.userId) {
+          console.log('[fallback] push anyway');
+          await linePush(ev.source.userId, msg + (replyOK ? '' : '\n(Reply失敗，改用Push)'));
+        } else {
+          console.log('[no userId] cannot push');
         }
       }
-    } catch (e) {
-      console.error('[handler error]', e);
-    }
+    } catch(e){ console.error('[handler error]', e); }
   })();
 
   if (event?.waitUntil) event.waitUntil(work);
