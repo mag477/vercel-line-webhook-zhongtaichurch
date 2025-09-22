@@ -19,20 +19,10 @@ const VERSE_POOL = [
 function todayKey() {
   const now = new Date();
   const tzNow = new Date(now.toLocaleString('en-US', { timeZone: TZ }));
-  const yyyy = tzNow.getFullYear();
-  const mm = String(tzNow.getMonth() + 1).padStart(2, '0');
-  const dd = String(tzNow.getDate()).padStart(2, '0');
-  return `${yyyy}${mm}${dd}`;
+  return `${tzNow.getFullYear()}${String(tzNow.getMonth()+1).padStart(2,'0')}${String(tzNow.getDate()).padStart(2,'0')}`;
 }
-function hashMod(str, mod) {
-  let h = 0;
-  for (let i = 0; i < str.length; i++) h = ((h << 5) - h + str.charCodeAt(i)) | 0;
-  return Math.abs(h) % mod;
-}
-function pickToday() {
-  const idx = hashMod(todayKey(), VERSE_POOL.length);
-  return VERSE_POOL[idx];
-}
+function hashMod(str, mod) { let h=0; for(let i=0;i<str.length;i++) h=((h<<5)-h+str.charCodeAt(i))|0; return Math.abs(h)%mod; }
+function pickToday(){ return VERSE_POOL[ hashMod(todayKey(), VERSE_POOL.length) ]; }
 
 async function fetchFHLVerse(book, chap, verse) {
   const url = 'https://bible.fhl.net/json/qb.php?q=' + encodeURIComponent(`${book}${chap}:${verse}`);
@@ -42,8 +32,7 @@ async function fetchFHLVerse(book, chap, verse) {
     console.log('[FHL] status', res.status, 'len', txt.length);
     const data = JSON.parse(txt);
     const rec = data?.record?.[0];
-    const vtext = rec?.bible_text ? String(rec.bible_text).trim() : '';
-    return `（${book}${chap}:${verse}）${vtext}`;
+    return `（${book}${chap}:${verse}）${(rec?.bible_text ?? '').toString().trim()}`;
   } catch (e) {
     console.error('[FHL] error', e);
     return '（暫時無法取得 FHL 經文）';
@@ -62,11 +51,24 @@ async function replyMessage(replyToken, text) {
   return res.ok;
 }
 
+async function pushMessage(userId, text) {
+  const payload = { to: userId, messages: [{ type: 'text', text }] };
+  const res = await fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + LINE_TOKEN },
+    body: JSON.stringify(payload),
+  });
+  const respText = await res.text();
+  console.log('[LINE push] status', res.status, respText);
+  return res.ok;
+}
+
 export default async function handler(req, event) {
   if (req.method === 'GET') return new Response('OK', { status: 200 });
 
   console.log('--- incoming', req.method, 'tokenSet=', !!LINE_TOKEN);
-  const ack = new Response('OK', { status: 200 }); // 先回 200，避免逾時
+  const ack = new Response('OK', { status: 200 });
+
   const work = (async () => {
     try {
       const bodyText = await req.text();
@@ -76,19 +78,29 @@ export default async function handler(req, event) {
       console.log('[events length]', events.length);
 
       for (const ev of events) {
-        if (ev.type === 'message' && typeof ev.message?.text === 'string') {
-          const text = ev.message.text.trim();
-          console.log('[incoming text]', text);
-          if (/^(每日經文|今日經文|經文)$/.test(text)) {
-            const pick = pickToday();
-            const verse = await fetchFHLVerse(pick.book, pick.chap, pick.verse);
-            const msg = `📖 今日金句（${pick.book}${pick.chap}:${pick.verse}）\n${verse}\n來源：信望愛 FHL 查經平台`;
-            await replyMessage(ev.replyToken, msg);
-          } else {
-            console.log('[skip] not match keyword');
-          }
-        } else {
-          console.log('[skip] non-text event type=', ev.type);
+        if (ev.type !== 'message' || typeof ev.message?.text !== 'string') {
+          console.log('[skip] type=', ev.type);
+          continue;
+        }
+        const text = ev.message.text.trim();
+        console.log('[incoming text]', text, 'userId=', ev.source?.userId);
+
+        if (!/^(每日經文|今日經文|經文)$/.test(text)) {
+          console.log('[skip] not match');
+          continue;
+        }
+
+        const pick = pickToday();
+        const verse = await fetchFHLVerse(pick.book, pick.chap, pick.verse);
+        const msg = `📖 今日金句（${pick.book}${pick.chap}:${pick.verse}）\n${verse}\n來源：信望愛 FHL 查經平台`;
+
+        // 先嘗試 Reply
+        const ok = await replyMessage(ev.replyToken, msg);
+
+        // 若 Reply 失敗（401/400/403），再「推播給同一位使用者」當備援
+        if (!ok && ev.source?.userId) {
+          console.log('[fallback] try push');
+          await pushMessage(ev.source.userId, msg + '\n(Reply失敗，改用Push)');
         }
       }
     } catch (e) {
